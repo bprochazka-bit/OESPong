@@ -27,10 +27,25 @@ STATE_INTRO_OUT   = 3
 STATE_TO_TITLE    = 4
 STATE_TITLE_IN    = 5
 STATE_TITLE       = 6
+STATE_MENU        = 7
+STATE_MENU_OUT    = 8
+STATE_GAME_STUB   = 9
 
-; Controller bit for Start
-BTN_START = $10
+; Controller bits (standard NES button order)
 BTN_A     = $80
+BTN_B     = $40
+BTN_SEL   = $20
+BTN_START = $10
+BTN_UP    = $08
+BTN_DOWN  = $04
+BTN_LEFT  = $02
+BTN_RIGHT = $01
+
+; Cursor sprite Y positions (1 PLAYER row 16, 2 PLAYERS row 18).
+; NES OAM Y is drawn one scanline below the stored value.
+CURSOR_X        = 72
+CURSOR_Y_1P     = 16*8 - 1
+CURSOR_Y_2P     = 18*8 - 1
 
 ; ---------------- Zero page variables ------------------------
 .segment "ZEROPAGE"
@@ -47,8 +62,8 @@ nmi_done:       .res 1      ; toggles each NMI
 music_idx:      .res 1
 music_timer:    .res 1
 music_on:       .res 1
-blink_timer:    .res 1
-show_prompt:    .res 1
+menu_selection: .res 1      ; 0 = 1 PLAYER, 1 = 2 PLAYERS
+player_count:   .res 1      ; 1 or 2 - committed at Start press
 tmp0:           .res 1
 tmp1:           .res 1
 ptr:            .res 2
@@ -210,18 +225,33 @@ main_loop:
 
     lda state
     cmp #STATE_INTRO_IN
-    beq intro_in
-    cmp #STATE_INTRO_HOLD
-    beq intro_hold
-    cmp #STATE_INTRO_OUT
-    beq intro_out
-    cmp #STATE_TO_TITLE
-    beq to_title
-    cmp #STATE_TITLE_IN
-    beq title_in
-    cmp #STATE_TITLE
-    beq title
-    rts
+    bne :+
+    jmp intro_in
+:   cmp #STATE_INTRO_HOLD
+    bne :+
+    jmp intro_hold
+:   cmp #STATE_INTRO_OUT
+    bne :+
+    jmp intro_out
+:   cmp #STATE_TO_TITLE
+    bne :+
+    jmp to_title
+:   cmp #STATE_TITLE_IN
+    bne :+
+    jmp title_in
+:   cmp #STATE_TITLE
+    bne :+
+    jmp title
+:   cmp #STATE_MENU
+    bne :+
+    jmp menu
+:   cmp #STATE_MENU_OUT
+    bne :+
+    jmp menu_out
+:   cmp #STATE_GAME_STUB
+    bne :+
+    jmp game_stub
+:   rts
 
 intro_in:
     ; fade in once every 12 frames, up to level 4
@@ -299,7 +329,67 @@ title_in:
 :   rts
 
 title:
-    ; Wait for Start press - milestone 2 handles the menu transition.
+    ; Start press opens the player-select menu.
+    lda pad1_new
+    and #BTN_START
+    beq :+
+    jsr open_menu
+    lda #STATE_MENU
+    sta state
+    lda #0
+    sta state_timer
+:   rts
+
+menu:
+    ; D-pad up/down toggles selection. Only act on newly-pressed edges.
+    lda pad1_new
+    and #(BTN_UP | BTN_DOWN)
+    beq @check_start
+    ; toggle 0 <-> 1
+    lda menu_selection
+    eor #$01
+    sta menu_selection
+    jsr update_cursor_sprite
+@check_start:
+    lda pad1_new
+    and #BTN_START
+    beq :+
+    ; Commit: 1 PLAYER -> 1, 2 PLAYERS -> 2
+    lda menu_selection
+    clc
+    adc #1
+    sta player_count
+    lda #STATE_MENU_OUT
+    sta state
+    lda #0
+    sta state_timer
+:   rts
+
+menu_out:
+    ; Fade music out in lockstep with the picture.
+    lda frame_counter
+    and #$0F
+    bne :+
+    lda fade_level
+    beq :+
+    dec fade_level
+:   lda fade_level
+    bne :+
+    ; Fully black - silence APU, hide cursor, hand off to game stub.
+    lda #0
+    sta music_on
+    sta $4000
+    sta $4008
+    lda #$30
+    sta $4000
+    lda #$FF                  ; move cursor off-screen
+    sta oam_buffer + 0
+    lda #STATE_GAME_STUB
+    sta state
+:   rts
+
+game_stub:
+    ; Milestone 3 replaces this with the play field.
     rts
 .endproc
 
@@ -560,11 +650,86 @@ title:
     lda #>press_start_text
     sta ptr+1
     jsr write_string
+    rts
+.endproc
 
-    lda #1
-    sta show_prompt
+; -------------------------------------------------------------
+; Draw the player-select menu below the PONG title.
+; Rendering must already be disabled by caller.
+; -------------------------------------------------------------
+.proc open_menu
+    ; Disable rendering while we write nametable.
+    lda #$00
+    sta PPU_MASK
+
+    ; Row 16, col 12: "1 PLAYER"
+    lda #$22
+    sta PPU_ADDR
+    lda #$0C
+    sta PPU_ADDR
+    lda #<menu_1p_text
+    sta ptr
+    lda #>menu_1p_text
+    sta ptr+1
+    jsr write_string
+
+    ; Row 18, col 11: "2 PLAYERS"
+    lda #$22
+    sta PPU_ADDR
+    lda #$4B
+    sta PPU_ADDR
+    lda #<menu_2p_text
+    sta ptr
+    lda #>menu_2p_text
+    sta ptr+1
+    jsr write_string
+
+    ; Clear PRESS START prompt (row 20, col 10, 11 tiles)
+    lda #$22
+    sta PPU_ADDR
+    lda #$8A
+    sta PPU_ADDR
+    ldx #11
     lda #0
-    sta blink_timer
+:   sta PPU_DATA
+    dex
+    bne :-
+
+    ; Reset scroll + restore CTRL since our writes clobber PPU latches.
+    lda #$00
+    sta PPU_SCROLL
+    sta PPU_SCROLL
+    lda ppu_ctrl_shadow
+    sta PPU_CTRL
+    lda ppu_mask_shadow
+    sta PPU_MASK
+
+    ; Install cursor sprite (OAM slot 0).
+    lda #0
+    sta menu_selection
+    jsr update_cursor_sprite
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; Position the cursor sprite (OAM slot 0) based on menu_selection.
+; -------------------------------------------------------------
+.proc update_cursor_sprite
+    ; Y
+    lda menu_selection
+    beq @pos_1p
+    lda #CURSOR_Y_2P
+    jmp @setY
+@pos_1p:
+    lda #CURSOR_Y_1P
+@setY:
+    sta oam_buffer + 0
+    lda #$03                ; tile index = arrow (sprite pattern table)
+    sta oam_buffer + 1
+    lda #$00                ; attr: palette 0 (red), no flip, in front
+    sta oam_buffer + 2
+    lda #CURSOR_X
+    sta oam_buffer + 3
     rts
 .endproc
 
@@ -744,6 +909,10 @@ intro_line2:
     .byte "PRESENTS", 0
 press_start_text:
     .byte "PRESS START", 0
+menu_1p_text:
+    .byte "1 PLAYER", 0
+menu_2p_text:
+    .byte "2 PLAYERS", 0
 
 ; APU note periods: C4, E4, G4, C5, G4, E4, C4, rest
 music_note_lo:

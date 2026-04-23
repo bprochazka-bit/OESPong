@@ -21,6 +21,7 @@ Layout:
     $00       blank
     $01       paddle tile (solid 8x8)
     $02       ball tile (3x3 centered dot)
+    $03       right-pointing arrow (menu cursor)
 """
 import os, sys
 
@@ -468,6 +469,28 @@ def build_bg():
     return bytes(data)
 
 
+def arrow_tile():
+    rows = [
+        "        ",
+        " X      ",
+        " XX     ",
+        " XXX    ",
+        " XXXX   ",
+        " XXX    ",
+        " XX     ",
+        " X      ",
+    ]
+    p0 = bytearray()
+    p1 = bytearray()
+    for r in rows:
+        b = 0
+        for i, c in enumerate(r):
+            if c != ' ':
+                b |= (1 << (7 - i))
+        p0.append(b); p1.append(0)
+    return bytes(p0 + p1)
+
+
 def build_sprite():
     data = bytearray(0x1000)
     def put(idx, tile):
@@ -475,6 +498,7 @@ def build_sprite():
     # $00 blank
     put(0x01, solid_tile())       # paddle
     put(0x02, ball_tile())        # ball
+    put(0x03, arrow_tile())       # menu cursor
     return bytes(data)
 
 
