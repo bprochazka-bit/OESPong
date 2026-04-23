@@ -52,17 +52,28 @@ CURSOR_Y_2P     = 18*8 - 1
 
 ; Play-field layout
 PADDLE_TILES    = 4             ; 8*4 = 32 pixels tall
+PADDLE_H        = PADDLE_TILES*8
 P1_X            = 8             ; left paddle column (pixel X)
 P2_X            = 240           ; right paddle column
+P1_RIGHT        = P1_X + 8      ; ball reflects when ball_x <= P1_RIGHT
+P2_LEFT         = P2_X          ; ball reflects when ball_x >= P2_LEFT
 PADDLE_MIN_Y    = 16            ; top of playfield (below scoreboard)
-PADDLE_MAX_Y    = 240 - (PADDLE_TILES*8)  ; bottom clamp
+PADDLE_MAX_Y    = 240 - PADDLE_H
 PADDLE_START_Y  = 104           ; roughly vertical centre
 PADDLE_SPEED    = 2             ; pixels per frame
 
+; Ball
+BALL_TOP        = 16
+BALL_BOTTOM     = 232
+BALL_VX_BASE    = 2             ; absolute horizontal speed
+BALL_VY_MAX     = 2             ; clamp for |ball_vy|
+WIN_SCORE       = 3
+
 ; Sprite OAM slot assignments
 OAM_CURSOR      = 0
-OAM_P1          = 1             ; + 0..3 -> 4 sprite slots
-OAM_P2          = 5             ; + 0..3 -> 4 sprite slots
+OAM_P1          = 1             ; 4 slots: 1..4
+OAM_P2          = 5             ; 4 slots: 5..8
+OAM_BALL        = 9
 
 ; ---------------- Zero page variables ------------------------
 .segment "ZEROPAGE"
@@ -88,6 +99,16 @@ p2_score:       .res 1
 pad2:           .res 1
 pad2_new:       .res 1
 pad2_last:      .res 1
+ball_x:         .res 1      ; pixel position
+ball_y:         .res 1
+ball_vx:        .res 1      ; signed pixels/frame
+ball_vy:        .res 1      ; signed pixels/frame
+ball_on_paddle: .res 1      ; 1 = ball stuck to P1 paddle
+vram_hi:        .res 1      ; single-tile VRAM update slot
+vram_lo:        .res 1
+vram_val:       .res 1
+vram_pending:   .res 1
+pending_p2_reset:.res 1      ; queue a "P2 = 0" write on the next frame
 tmp0:           .res 1
 tmp1:           .res 1
 ptr:            .res 2
@@ -471,15 +492,32 @@ game_in:
 :   rts
 
 game:
-    ; P1 paddle always follows controller 1.
+    ; Drain a deferred "P2 score = 0" from last frame's game-over.
+    lda pending_p2_reset
+    beq :+
+    jsr push_p2_score
+    lda #0
+    sta pending_p2_reset
+:
     jsr move_paddle_p1
-
-    ; P2 paddle: controller 2 in 2P mode, stays centred for 1P demo.
     lda player_count
     cmp #2
     bne :+
     jsr move_paddle_p2
-:   rts
+    jmp @ball
+:   jsr ai_paddle_p2
+@ball:
+    lda ball_on_paddle
+    beq :+
+    jsr ball_follow_p1
+    lda pad1_new
+    and #BTN_A
+    beq @done
+    jsr ball_release
+    jmp @done
+:   jsr ball_tick
+@done:
+    rts
 .endproc
 
 ; -------------------------------------------------------------
@@ -497,6 +535,19 @@ game:
     sta OAM_ADDR
     lda #>oam_buffer
     sta OAM_DMA
+
+    ; --- Single-tile VRAM update (drained once per frame) ---
+    lda vram_pending
+    beq @no_vram
+    lda vram_hi
+    sta PPU_ADDR
+    lda vram_lo
+    sta PPU_ADDR
+    lda vram_val
+    sta PPU_DATA
+    lda #0
+    sta vram_pending
+@no_vram:
 
     ; --- Recompute live palette from target + fade_level, upload ---
     jsr apply_fade
@@ -883,6 +934,7 @@ game:
     sta p2_score
 
     jsr refresh_paddles
+    jsr ball_reset_on_paddle
     rts
 .endproc
 
@@ -1018,6 +1070,336 @@ game:
 @save:
     sta p2_y
 @refresh:
+    jsr refresh_paddles
+    rts
+.endproc
+
+; =============================================================
+; Ball
+; =============================================================
+; Reset ball onto P1 paddle; caller should have set p1_y already.
+.proc ball_reset_on_paddle
+    lda #1
+    sta ball_on_paddle
+    lda #0
+    sta ball_vx
+    sta ball_vy
+    ; sit ball one pixel right of P1 paddle
+    lda #P1_X + 10
+    sta ball_x
+    lda p1_y
+    clc
+    adc #(PADDLE_H/2 - 4)     ; vertical centre of paddle
+    sta ball_y
+    jsr refresh_ball
+    rts
+.endproc
+
+; Stick ball to the P1 paddle every frame while ball_on_paddle is set.
+.proc ball_follow_p1
+    lda p1_y
+    clc
+    adc #(PADDLE_H/2 - 4)
+    sta ball_y
+    jsr refresh_ball
+    rts
+.endproc
+
+; Write ball sprite (OAM slot 9) from ball_x/ball_y.
+.proc refresh_ball
+    lda ball_y
+    sta oam_buffer + OAM_BALL * 4 + 0
+    lda #$02                     ; tile = centred dot
+    sta oam_buffer + OAM_BALL * 4 + 1
+    lda #%00000010               ; sprite palette 2 (white)
+    sta oam_buffer + OAM_BALL * 4 + 2
+    lda ball_x
+    sta oam_buffer + OAM_BALL * 4 + 3
+    rts
+.endproc
+
+; Launch the ball from P1 paddle. Direction = right; vertical
+; component comes from whichever D-pad bit pad1 currently holds.
+.proc ball_release
+    lda #0
+    sta ball_on_paddle
+    lda #BALL_VX_BASE
+    sta ball_vx
+    lda pad1
+    and #BTN_UP
+    beq @not_up
+    lda #<-1              ; ball_vy = -1 (upward)
+    sta ball_vy
+    rts
+@not_up:
+    lda pad1
+    and #BTN_DOWN
+    beq @flat
+    lda #1
+    sta ball_vy
+    rts
+@flat:
+    lda #0
+    sta ball_vy
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; Queue a single-tile VRAM write. A = tile; hi/lo passed in tmp0/tmp1.
+; -------------------------------------------------------------
+.proc queue_vram
+    sta vram_val
+    lda tmp0
+    sta vram_hi
+    lda tmp1
+    sta vram_lo
+    lda #1
+    sta vram_pending
+    rts
+.endproc
+
+; Update P1 score tile at row 2, col 10 ($204A).
+.proc push_p1_score
+    lda #$20
+    sta tmp0
+    lda #$4A
+    sta tmp1
+    lda p1_score
+    clc
+    adc #$1B              ; tile for '0'
+    jmp queue_vram
+.endproc
+
+; Update P2 score tile at row 2, col 21 ($2055).
+.proc push_p2_score
+    lda #$20
+    sta tmp0
+    lda #$55
+    sta tmp1
+    lda p2_score
+    clc
+    adc #$1B
+    jmp queue_vram
+.endproc
+
+; Clamp paddle Y in A to [PADDLE_MIN_Y, PADDLE_MAX_Y]; returns in A.
+.proc clamp_paddle_y
+    cmp #PADDLE_MIN_Y
+    bcs :+
+    lda #PADDLE_MIN_Y
+    rts
+:   cmp #PADDLE_MAX_Y+1
+    bcc :+
+    lda #PADDLE_MAX_Y
+:   rts
+.endproc
+
+; Clamp ball_vy to [-BALL_VY_MAX, +BALL_VY_MAX] (treats A as signed).
+.proc clamp_ball_vy
+    lda ball_vy
+    bmi @neg
+    cmp #BALL_VY_MAX+1
+    bcc @done
+    lda #BALL_VY_MAX
+    sta ball_vy
+    rts
+@neg:
+    cmp #<-BALL_VY_MAX
+    bcs @done
+    lda #<-BALL_VY_MAX
+    sta ball_vy
+@done:
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; Ball per-frame update while it is in flight.
+; -------------------------------------------------------------
+.proc ball_tick
+    ; ball_x += ball_vx  (ball_vx is signed two's-complement)
+    clc
+    lda ball_x
+    adc ball_vx
+    sta ball_x
+
+    ; ball_y += ball_vy
+    clc
+    lda ball_y
+    adc ball_vy
+    sta ball_y
+
+    ; Top wall
+    lda ball_y
+    cmp #BALL_TOP
+    bcs @not_top
+    lda #BALL_TOP
+    sta ball_y
+    lda #0
+    sec
+    sbc ball_vy
+    sta ball_vy
+@not_top:
+
+    ; Bottom wall
+    lda ball_y
+    cmp #BALL_BOTTOM+1
+    bcc @not_bot
+    lda #BALL_BOTTOM
+    sta ball_y
+    lda #0
+    sec
+    sbc ball_vy
+    sta ball_vy
+@not_bot:
+
+    ; Horizontal: paddle reflect vs score
+    lda ball_vx
+    bpl @right
+
+    ; --- Moving left: test P1 paddle ---
+    lda ball_x
+    cmp #P1_RIGHT+1
+    bcs @check_score_left
+    ; within P1 X column - check Y overlap
+    lda ball_y
+    cmp p1_y
+    bcc @miss_p1
+    sec
+    sbc p1_y
+    cmp #PADDLE_H
+    bcs @miss_p1
+    ; Hit P1: reflect and apply spin from pad1 direction
+    lda #0
+    sec
+    sbc ball_vx
+    sta ball_vx
+    lda pad1
+    and #BTN_UP
+    beq :+
+    dec ball_vy
+:   lda pad1
+    and #BTN_DOWN
+    beq :+
+    inc ball_vy
+:   jsr clamp_ball_vy
+    ; nudge ball just right of paddle so we do not re-hit next frame
+    lda #P1_RIGHT+1
+    sta ball_x
+    jmp @done
+@miss_p1:
+    ; Still in the paddle lane but not intersecting; don't score yet.
+@check_score_left:
+    lda ball_x
+    cmp #4
+    bcs @done
+    ; Ball off left - P2 scores.
+    inc p2_score
+    jsr push_p2_score
+    jsr check_game_over
+    jsr ball_reset_on_paddle
+    jmp @done
+
+@right:
+    ; --- Moving right: test P2 paddle ---
+    lda ball_x
+    cmp #P2_LEFT
+    bcc @check_score_right
+    lda ball_y
+    cmp p2_y
+    bcc @miss_p2
+    sec
+    sbc p2_y
+    cmp #PADDLE_H
+    bcs @miss_p2
+    ; Hit P2: reflect and apply spin from pad2 direction. In 1P mode
+    ; the CPU still "presses" a direction based on where it moved -
+    ; approximate by using pad2's state (all zero for unplugged pad2)
+    ; so the AI hit is always flat; good enough for a first cut.
+    lda #0
+    sec
+    sbc ball_vx
+    sta ball_vx
+    lda pad2
+    and #BTN_UP
+    beq :+
+    dec ball_vy
+:   lda pad2
+    and #BTN_DOWN
+    beq :+
+    inc ball_vy
+:   jsr clamp_ball_vy
+    lda #P2_LEFT-1
+    sta ball_x
+    jmp @done
+@miss_p2:
+@check_score_right:
+    lda ball_x
+    cmp #252
+    bcc @done
+    inc p1_score
+    jsr push_p1_score
+    jsr check_game_over
+    jsr ball_reset_on_paddle
+
+@done:
+    jsr refresh_ball
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; If either score reaches WIN_SCORE, reset both scoreboards and scores.
+; -------------------------------------------------------------
+.proc check_game_over
+    lda p1_score
+    cmp #WIN_SCORE
+    bcs @restart
+    lda p2_score
+    cmp #WIN_SCORE
+    bcs @restart
+    rts
+@restart:
+    lda #0
+    sta p1_score
+    sta p2_score
+    jsr push_p1_score         ; queue P1 tile reset this frame
+    lda #1
+    sta pending_p2_reset      ; next frame, queue P2 tile reset
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; CPU AI for P2 in 1P mode: move P2 paddle toward ball center.
+; -------------------------------------------------------------
+.proc ai_paddle_p2
+    ; Only chase when the ball is moving toward P2 or sitting still.
+    lda ball_vx
+    bmi @hold             ; moving away - idle
+    ; target = ball_y - PADDLE_H/2 + 4  (align paddle centre to ball)
+    lda ball_y
+    sec
+    sbc #(PADDLE_H/2 - 4)
+    sta tmp0
+    lda p2_y
+    cmp tmp0
+    beq @hold
+    bcs @go_up
+    ; p2_y < tmp0 -> move down
+    clc
+    adc #PADDLE_SPEED
+    cmp tmp0
+    bcc @save
+    lda tmp0
+    jmp @save
+@go_up:
+    sec
+    sbc #PADDLE_SPEED
+    cmp tmp0
+    bcs @save
+    lda tmp0
+@save:
+    jsr clamp_paddle_y
+    sta p2_y
+@hold:
     jsr refresh_paddles
     rts
 .endproc
