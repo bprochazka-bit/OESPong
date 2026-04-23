@@ -29,7 +29,9 @@ STATE_TITLE_IN    = 5
 STATE_TITLE       = 6
 STATE_MENU        = 7
 STATE_MENU_OUT    = 8
-STATE_GAME_STUB   = 9
+STATE_TO_GAME     = 9
+STATE_GAME_IN     = 10
+STATE_GAME        = 11
 
 ; Controller bits (standard NES button order)
 BTN_A     = $80
@@ -48,6 +50,20 @@ CURSOR_X        = 11*8
 CURSOR_Y_1P     = 16*8 - 1
 CURSOR_Y_2P     = 18*8 - 1
 
+; Play-field layout
+PADDLE_TILES    = 4             ; 8*4 = 32 pixels tall
+P1_X            = 8             ; left paddle column (pixel X)
+P2_X            = 240           ; right paddle column
+PADDLE_MIN_Y    = 16            ; top of playfield (below scoreboard)
+PADDLE_MAX_Y    = 240 - (PADDLE_TILES*8)  ; bottom clamp
+PADDLE_START_Y  = 104           ; roughly vertical centre
+PADDLE_SPEED    = 2             ; pixels per frame
+
+; Sprite OAM slot assignments
+OAM_CURSOR      = 0
+OAM_P1          = 1             ; + 0..3 -> 4 sprite slots
+OAM_P2          = 5             ; + 0..3 -> 4 sprite slots
+
 ; ---------------- Zero page variables ------------------------
 .segment "ZEROPAGE"
 frame_counter:  .res 1
@@ -65,6 +81,13 @@ music_timer:    .res 1
 music_on:       .res 1
 menu_selection: .res 1      ; 0 = 1 PLAYER, 1 = 2 PLAYERS
 player_count:   .res 1      ; 1 or 2 - committed at Start press
+p1_y:           .res 1      ; top-left Y of P1 paddle (pixels)
+p2_y:           .res 1      ; top-left Y of P2 paddle (pixels)
+p1_score:       .res 1
+p2_score:       .res 1
+pad2:           .res 1
+pad2_new:       .res 1
+pad2_last:      .res 1
 tmp0:           .res 1
 tmp1:           .res 1
 ptr:            .res 2
@@ -168,7 +191,7 @@ palette_live:   .res 32
 ; -------------------------------------------------------------
 main_loop:
     jsr wait_nmi
-    jsr read_pad1
+    jsr read_pads
     jsr tick_state
     jsr tick_music
     jmp main_loop
@@ -185,11 +208,14 @@ main_loop:
 .endproc
 
 ; -------------------------------------------------------------
-; Read controller 1 into pad1 and pad1_new (pressed-this-frame)
+; Read both controllers. The $4016 strobe resets both shift
+; registers; we then read JOY1 8 times then JOY2 8 times.
 ; -------------------------------------------------------------
-.proc read_pad1
+.proc read_pads
     lda pad1
     sta pad1_last
+    lda pad2
+    sta pad2_last
 
     ; Strobe
     lda #$01
@@ -199,7 +225,7 @@ main_loop:
 
     ldx #8
     lda #0
-@loop:
+@l1:
     pha
     lda JOY1
     and #%00000001
@@ -207,14 +233,31 @@ main_loop:
     pla
     rol a
     dex
-    bne @loop
+    bne @l1
     sta pad1
 
-    ; Newly pressed this frame = pad1 & ~pad1_last
+    ldx #8
+    lda #0
+@l2:
+    pha
+    lda JOY2
+    and #%00000001
+    lsr a
+    pla
+    rol a
+    dex
+    bne @l2
+    sta pad2
+
+    ; Newly pressed this frame = pad & ~pad_last
     lda pad1
     eor pad1_last
     and pad1
     sta pad1_new
+    lda pad2
+    eor pad2_last
+    and pad2
+    sta pad2_new
     rts
 .endproc
 
@@ -250,9 +293,15 @@ main_loop:
 :   cmp #STATE_MENU_OUT
     bne :+
     jmp menu_out
-:   cmp #STATE_GAME_STUB
+:   cmp #STATE_TO_GAME
     bne :+
-    jmp game_stub
+    jmp to_game
+:   cmp #STATE_GAME_IN
+    bne :+
+    jmp game_in
+:   cmp #STATE_GAME
+    bne :+
+    jmp game
 :   rts
 
 intro_in:
@@ -377,7 +426,7 @@ menu_out:
     dec fade_level
 :   lda fade_level
     bne :+
-    ; Fully black - silence APU, hide cursor, hand off to game stub.
+    ; Fully black - silence APU, hide cursor, hand off to play field.
     lda #0
     sta music_on
     sta $4000
@@ -386,13 +435,51 @@ menu_out:
     sta $4000
     lda #$FF                  ; move cursor off-screen
     sta oam_buffer + 0
-    lda #STATE_GAME_STUB
+    lda #STATE_TO_GAME
     sta state
 :   rts
 
-game_stub:
-    ; Milestone 3 replaces this with the play field.
+to_game:
+    ; Build the play field while the screen is already black.
+    lda #$00
+    sta PPU_MASK
+    jsr load_game_screen
+    lda ppu_mask_shadow
+    sta PPU_MASK
+    lda #STATE_GAME_IN
+    sta state
+    lda #0
+    sta state_timer
     rts
+
+game_in:
+    ; Fade the play field in, then release control to the user.
+    lda frame_counter
+    and #$0F
+    bne :+
+    lda fade_level
+    cmp #4
+    bcs :+
+    inc fade_level
+:   lda fade_level
+    cmp #4
+    bne :+
+    lda #STATE_GAME
+    sta state
+    lda #0
+    sta state_timer
+:   rts
+
+game:
+    ; P1 paddle always follows controller 1.
+    jsr move_paddle_p1
+
+    ; P2 paddle: controller 2 in 2P mode, stays centred for 1P demo.
+    lda player_count
+    cmp #2
+    bne :+
+    jsr move_paddle_p2
+:   rts
 .endproc
 
 ; -------------------------------------------------------------
@@ -735,6 +822,206 @@ game_stub:
     rts
 .endproc
 
+; =============================================================
+; Play field (milestone 3)
+; =============================================================
+.proc load_game_screen
+    ; Load game palette target.
+    ldx #0
+@pal:
+    lda game_palette, x
+    sta palette_target, x
+    inx
+    cpx #32
+    bne @pal
+
+    ; Clear nametable 0.
+    lda #$20
+    sta PPU_ADDR
+    lda #$00
+    sta PPU_ADDR
+    lda #0
+    ldx #4
+    ldy #0
+@clr:
+    sta PPU_DATA
+    iny
+    bne @clr
+    dex
+    bne @clr
+
+    ; Scoreboard tiles at row 2, cols 10 and 21 (symmetric around centre).
+    ; VRAM = $2000 + 2*32 + 10 = $204A
+    lda #$20
+    sta PPU_ADDR
+    lda #$4A
+    sta PPU_ADDR
+    lda #$1B                  ; glyph '0'
+    sta PPU_DATA
+
+    ; VRAM = $2000 + 2*32 + 21 = $2055
+    lda #$20
+    sta PPU_ADDR
+    lda #$55
+    sta PPU_ADDR
+    lda #$1B
+    sta PPU_DATA
+
+    ; Reset scroll and CTRL after direct VRAM writes.
+    lda #$00
+    sta PPU_SCROLL
+    sta PPU_SCROLL
+    lda ppu_ctrl_shadow
+    sta PPU_CTRL
+
+    ; Reset game state variables.
+    lda #PADDLE_START_Y
+    sta p1_y
+    sta p2_y
+    lda #0
+    sta p1_score
+    sta p2_score
+
+    jsr refresh_paddles
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; Write the 4+4 paddle sprites to OAM from p1_y / p2_y.
+; -------------------------------------------------------------
+.proc refresh_paddles
+    ; --- P1 (red, sprite palette 0) ---
+    lda p1_y
+    sta tmp0
+    ldx #0
+@p1:
+    txa
+    asl a
+    asl a
+    clc
+    adc #(OAM_P1 * 4)
+    tay
+    lda tmp0
+    sta oam_buffer, y         ; Y
+    iny
+    lda #$01                  ; tile = solid 8x8
+    sta oam_buffer, y
+    iny
+    lda #%00000000            ; attr: sprite palette 0 (red)
+    sta oam_buffer, y
+    iny
+    lda #P1_X
+    sta oam_buffer, y
+    lda tmp0
+    clc
+    adc #8
+    sta tmp0
+    inx
+    cpx #PADDLE_TILES
+    bne @p1
+
+    ; --- P2 (blue, sprite palette 1) ---
+    lda p2_y
+    sta tmp0
+    ldx #0
+@p2:
+    txa
+    asl a
+    asl a
+    clc
+    adc #(OAM_P2 * 4)
+    tay
+    lda tmp0
+    sta oam_buffer, y
+    iny
+    lda #$01
+    sta oam_buffer, y
+    iny
+    lda #%00000001            ; attr: sprite palette 1 (blue)
+    sta oam_buffer, y
+    iny
+    lda #P2_X
+    sta oam_buffer, y
+    lda tmp0
+    clc
+    adc #8
+    sta tmp0
+    inx
+    cpx #PADDLE_TILES
+    bne @p2
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; Move P1 paddle from controller 1 input with clamping.
+; -------------------------------------------------------------
+.proc move_paddle_p1
+    lda pad1
+    and #BTN_UP
+    beq @down
+    lda p1_y
+    sec
+    sbc #PADDLE_SPEED
+    bcc @clamp_top
+    cmp #PADDLE_MIN_Y
+    bcs @save
+@clamp_top:
+    lda #PADDLE_MIN_Y
+    jmp @save
+@down:
+    lda pad1
+    and #BTN_DOWN
+    beq @refresh
+    lda p1_y
+    clc
+    adc #PADDLE_SPEED
+    bcs @clamp_bot
+    cmp #PADDLE_MAX_Y+1
+    bcc @save
+@clamp_bot:
+    lda #PADDLE_MAX_Y
+@save:
+    sta p1_y
+@refresh:
+    jsr refresh_paddles
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; Move P2 paddle from controller 2 input with clamping.
+; -------------------------------------------------------------
+.proc move_paddle_p2
+    lda pad2
+    and #BTN_UP
+    beq @down
+    lda p2_y
+    sec
+    sbc #PADDLE_SPEED
+    bcc @clamp_top
+    cmp #PADDLE_MIN_Y
+    bcs @save
+@clamp_top:
+    lda #PADDLE_MIN_Y
+    jmp @save
+@down:
+    lda pad2
+    and #BTN_DOWN
+    beq @refresh
+    lda p2_y
+    clc
+    adc #PADDLE_SPEED
+    bcs @clamp_bot
+    cmp #PADDLE_MAX_Y+1
+    bcc @save
+@clamp_bot:
+    lda #PADDLE_MAX_Y
+@save:
+    sta p2_y
+@refresh:
+    jsr refresh_paddles
+    rts
+.endproc
+
 ; -------------------------------------------------------------
 ; Write the zero-terminated string at (ptr) to PPU_DATA.
 ; Characters use glyph table offset map.
@@ -905,6 +1192,18 @@ title_palette:
     .byte $0F, $21, $30, $30
     .byte $0F, $2A, $30, $30
     .byte $0F, $2C, $30, $30
+
+; Play-field palette: minimal BG (just white digits on black) plus
+; red/blue paddle colours and a white sprite for the (future) ball.
+game_palette:
+    .byte $0F, $30, $30, $30
+    .byte $0F, $30, $30, $30
+    .byte $0F, $30, $30, $30
+    .byte $0F, $30, $30, $30
+    .byte $0F, $16, $30, $30    ; sprite pal 0: red (P1 paddle)
+    .byte $0F, $12, $30, $30    ; sprite pal 1: blue (P2 paddle)
+    .byte $0F, $30, $30, $30    ; sprite pal 2: white (ball)
+    .byte $0F, $30, $30, $30
 
 intro_line1:
     .byte "OWEN ENTERTAINMENT SYSTEM", 0
