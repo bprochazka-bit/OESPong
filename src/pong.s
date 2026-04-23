@@ -41,9 +41,10 @@ BTN_DOWN  = $04
 BTN_LEFT  = $02
 BTN_RIGHT = $01
 
-; Cursor sprite Y positions (1 PLAYER row 16, 2 PLAYERS row 18).
-; NES OAM Y is drawn one scanline below the stored value.
-CURSOR_X        = 72
+; Menu layout - both options start at the same column so they line up,
+; arrow sprite sits two tiles to the left of the text with a one-tile gap.
+MENU_TEXT_COL   = 13
+CURSOR_X        = 11*8
 CURSOR_Y_1P     = 16*8 - 1
 CURSOR_Y_2P     = 18*8 - 1
 
@@ -143,6 +144,7 @@ palette_live:   .res 32
 
     jsr load_intro_screen
     jsr apu_init
+    jsr music_start           ; start jingle immediately on boot
 
     ; Enable NMI + BG pattern table 0 + sprite pattern table 1
     lda #%10001000          ; NMI on, sprites=$1000, bg=$0000
@@ -298,11 +300,11 @@ intro_out:
 :   rts
 
 to_title:
-    ; Disable rendering, swap to title nametable, re-enable
+    ; Disable rendering, swap to title nametable, re-enable.
+    ; (music already playing since reset - don't restart it here)
     lda #$00
     sta PPU_MASK
     jsr load_title_screen
-    jsr music_start
     lda ppu_mask_shadow
     sta PPU_MASK
     lda #STATE_TITLE_IN
@@ -662,10 +664,10 @@ game_stub:
     lda #$00
     sta PPU_MASK
 
-    ; Row 16, col 12: "1 PLAYER"
+    ; Row 16, col 13: "1 PLAYER"  ($2000 + 16*32 + 13 = $220D)
     lda #$22
     sta PPU_ADDR
-    lda #$0C
+    lda #$0D
     sta PPU_ADDR
     lda #<menu_1p_text
     sta ptr
@@ -673,10 +675,10 @@ game_stub:
     sta ptr+1
     jsr write_string
 
-    ; Row 18, col 11: "2 PLAYERS"
+    ; Row 18, col 13: "2 PLAYERS" ($2000 + 18*32 + 13 = $224D)
     lda #$22
     sta PPU_ADDR
-    lda #$4B
+    lda #$4D
     sta PPU_ADDR
     lda #<menu_2p_text
     sta ptr
@@ -823,6 +825,7 @@ game_stub:
     sta music_on
     lda #0
     sta music_idx
+    lda #1             ; ensure first dec hits zero on frame 1
     sta music_timer
     rts
 .endproc
