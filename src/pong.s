@@ -69,8 +69,9 @@ PADDLE_SPEED    = 2             ; pixels per frame
 ; Ball
 BALL_TOP        = 16
 BALL_BOTTOM     = 232
-BALL_VX_BASE    = 2             ; absolute horizontal speed
-BALL_VY_MAX     = 2             ; clamp for |ball_vy|
+BALL_VX_BASE    = 2             ; starting magnitude of ball_vx
+BALL_VX_MAX     = 4             ; cap as rally speeds up
+BALL_VY_MAX     = 3             ; clamp for |ball_vy|
 WIN_SCORE       = 3
 
 ; Sprite OAM slot assignments
@@ -115,9 +116,12 @@ vram_pending:   .res 1
 pending_p2_reset:.res 1      ; queue a "P2 = 0" write on the next frame
 winner:         .res 1      ; 1 or 2 - whoever triggered STATE_GAME_OVER
 difficulty_sel: .res 1      ; 0 = EASY, 1 = NORMAL, 2 = HARD
-ai_skip_mask:   .res 1      ; frame_counter AND mask - AI moves when result = 0
+ai_period:      .res 1      ; frames between AI moves (1 = every frame)
 ai_step:        .res 1      ; pixels per AI move
+ai_tick:        .res 1      ; counter vs ai_period
 pause_sel:      .res 1      ; 0 = RESUME, 1 = EXIT
+ball_speed:     .res 1      ; |ball_vx|, grows during a rally
+sfx_timer:      .res 1      ; frames remaining on the current Pulse 2 SFX
 tmp0:           .res 1
 tmp1:           .res 1
 ptr:            .res 2
@@ -224,6 +228,7 @@ main_loop:
     jsr read_pads
     jsr tick_state
     jsr tick_music
+    jsr tick_sfx
     jmp main_loop
 .endproc
 
@@ -1141,25 +1146,29 @@ to_title_fade:
 ; pressed on either the difficulty menu or the main menu (2P mode
 ; picks defaults here too).
 .proc apply_difficulty
+    lda #0
+    sta ai_tick
     lda difficulty_sel
     beq @easy
     cmp #2
     beq @hard
-    ; NORMAL
-    lda #$01
-    sta ai_skip_mask
+    ; NORMAL: AI moves once every 3 frames, 1 px per move
+    lda #3
+    sta ai_period
     lda #1
     sta ai_step
     rts
 @easy:
-    lda #$03
-    sta ai_skip_mask
+    ; EASY: once every 4 frames, 1 px
+    lda #4
+    sta ai_period
     lda #1
     sta ai_step
     rts
 @hard:
-    lda #$00
-    sta ai_skip_mask
+    ; HARD: every other frame, 2 px
+    lda #2
+    sta ai_period
     lda #2
     sta ai_step
     rts
@@ -1567,6 +1576,8 @@ to_title_fade:
     lda #0
     sta ball_vx
     sta ball_vy
+    lda #BALL_VX_BASE         ; rally speed resets on serve
+    sta ball_speed
     ; sit ball one pixel right of P1 paddle
     lda #P1_X + 10
     sta ball_x
@@ -1606,7 +1617,7 @@ to_title_fade:
 .proc ball_release
     lda #0
     sta ball_on_paddle
-    lda #BALL_VX_BASE
+    lda ball_speed
     sta ball_vx
     lda pad1
     and #BTN_UP
@@ -1751,10 +1762,12 @@ to_title_fade:
     sbc p1_y
     cmp #PADDLE_H
     bcs @miss_p1
-    ; Hit P1: reflect and apply spin from pad1 direction
-    lda #0
-    sec
-    sbc ball_vx
+    ; Hit P1: reflect to positive vx with rally speedup.
+    lda ball_speed
+    cmp #BALL_VX_MAX
+    bcs :+
+    inc ball_speed
+:   lda ball_speed
     sta ball_vx
     lda pad1
     and #BTN_UP
@@ -1765,6 +1778,7 @@ to_title_fade:
     beq :+
     inc ball_vy
 :   jsr clamp_ball_vy
+    jsr sfx_play_paddle
     ; nudge ball just right of paddle so we do not re-hit next frame
     lda #P1_RIGHT+1
     sta ball_x
@@ -1778,6 +1792,7 @@ to_title_fade:
     ; Ball off left - P2 scores.
     inc p2_score
     jsr push_p2_score
+    jsr sfx_play_score
     jsr check_game_over
     jsr ball_reset_on_paddle
     jmp @done
@@ -1794,13 +1809,16 @@ to_title_fade:
     sbc p2_y
     cmp #PADDLE_H
     bcs @miss_p2
-    ; Hit P2: reflect and apply spin from pad2 direction. In 1P mode
-    ; the CPU still "presses" a direction based on where it moved -
-    ; approximate by using pad2's state (all zero for unplugged pad2)
-    ; so the AI hit is always flat; good enough for a first cut.
-    lda #0
+    ; Hit P2: reflect to negative vx with rally speedup. In 1P mode
+    ; pad2 has no buttons set, so the CPU hit imparts no spin -
+    ; good enough for a first cut.
+    lda ball_speed
+    cmp #BALL_VX_MAX
+    bcs :+
+    inc ball_speed
+:   lda #0
     sec
-    sbc ball_vx
+    sbc ball_speed
     sta ball_vx
     lda pad2
     and #BTN_UP
@@ -1811,6 +1829,7 @@ to_title_fade:
     beq :+
     inc ball_vy
 :   jsr clamp_ball_vy
+    jsr sfx_play_paddle
     lda #P2_LEFT-1
     sta ball_x
     jmp @done
@@ -1821,6 +1840,7 @@ to_title_fade:
     bcc @done
     inc p1_score
     jsr push_p1_score
+    jsr sfx_play_score
     jsr check_game_over
     jsr ball_reset_on_paddle
 
@@ -1849,6 +1869,7 @@ to_title_fade:
     lda #2
     sta winner
 @enter:
+    jsr sfx_play_gameover
     jsr open_game_over_banner
     lda #STATE_GAME_OVER
     sta state
@@ -1867,10 +1888,13 @@ to_title_fade:
     lda ball_vx
     bmi @hold             ; moving away - idle
 
-    ; Throttle moves based on difficulty.
-    lda frame_counter
-    and ai_skip_mask
-    bne @hold
+    ; Throttle moves: only act once every ai_period frames.
+    inc ai_tick
+    lda ai_tick
+    cmp ai_period
+    bcc @hold
+    lda #0
+    sta ai_tick
 
     ; target = ball_y - PADDLE_H/2 + 4  (align paddle centre to ball)
     lda ball_y
@@ -1984,6 +2008,67 @@ to_title_fade:
     sta $4009
     sta $400A
     sta $400B
+    rts
+.endproc
+
+; =============================================================
+; Sound effects (Pulse 2 - Pulse 1 is reserved for the jingle)
+; =============================================================
+
+; Short high chirp for paddle hits.
+.proc sfx_play_paddle
+    lda #%10111111      ; duty=10, const vol, max volume
+    sta $4004
+    lda #$08
+    sta $4005           ; sweep off
+    lda #$40            ; period lo (high pitch)
+    sta $4006
+    lda #$00
+    sta $4007
+    lda #3
+    sta sfx_timer
+    rts
+.endproc
+
+; Lower-pitched ~200ms blip for a score.
+.proc sfx_play_score
+    lda #%10111111
+    sta $4004
+    lda #$08
+    sta $4005
+    lda #$FF
+    sta $4006
+    lda #$01
+    sta $4007
+    lda #12
+    sta sfx_timer
+    rts
+.endproc
+
+; Sustained low tone for game over.
+.proc sfx_play_gameover
+    lda #%10111111
+    sta $4004
+    lda #$08
+    sta $4005
+    lda #$FF
+    sta $4006
+    lda #$03
+    sta $4007
+    lda #45
+    sta sfx_timer
+    rts
+.endproc
+
+; Drain the sfx_timer every frame; silence Pulse 2 when it hits 0.
+.proc tick_sfx
+    lda sfx_timer
+    beq @done
+    dec sfx_timer
+    bne @done
+    lda #$30            ; duty 00, constant vol, vol = 0
+    sta $4004
+@done:
     rts
 .endproc
 
