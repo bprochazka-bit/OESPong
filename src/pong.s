@@ -729,14 +729,23 @@ to_title_fade:
     cpx #32
     bne @pal_loop
 
-    ; --- Reset scroll to 0 after PPU writes ---
+    ; --- Scroll reset: point v back to nametable start ---
+    ; Write PPU_ADDR = $0000 which forces both t and v registers
+    ; to a clean state before final scroll writes.
+    bit PPU_STATUS           ; w latch -> 0
     lda #$00
-    sta PPU_SCROLL
-    sta PPU_SCROLL
-
-    ; --- Re-latch PPU_CTRL (scroll reset may have clobbered) ---
+    sta PPU_ADDR             ; t hi = 0, w -> 1
+    sta PPU_ADDR             ; v = t = $0000, w -> 0
+    ; Now program nametable via CTRL and scroll X/Y
+    bit PPU_STATUS
+    lda #$00
+    sta PPU_ADDR
+    sta PPU_ADDR
     lda ppu_ctrl_shadow
     sta PPU_CTRL
+    lda #$00
+    sta PPU_SCROLL           ; X = 0
+    sta PPU_SCROLL           ; Y = 0
 
     inc nmi_done
 
@@ -1002,11 +1011,15 @@ to_title_fade:
     bne :-
 
     ; Reset scroll + restore CTRL since our writes clobber PPU latches.
+    bit PPU_STATUS
     lda #$00
-    sta PPU_SCROLL
-    sta PPU_SCROLL
+    sta PPU_ADDR
+    sta PPU_ADDR
     lda ppu_ctrl_shadow
     sta PPU_CTRL
+    lda #$00
+    sta PPU_SCROLL           ; X = 0
+    sta PPU_SCROLL           ; Y = 0
     lda ppu_mask_shadow
     sta PPU_MASK
 
@@ -1103,11 +1116,15 @@ to_title_fade:
     sta ptr+1
     jsr write_string
 
+    bit PPU_STATUS
     lda #$00
-    sta PPU_SCROLL
-    sta PPU_SCROLL
+    sta PPU_ADDR
+    sta PPU_ADDR
     lda ppu_ctrl_shadow
     sta PPU_CTRL
+    lda #$00
+    sta PPU_SCROLL           ; X = 0
+    sta PPU_SCROLL           ; Y = 0
     lda ppu_mask_shadow
     sta PPU_MASK
 
@@ -1214,11 +1231,15 @@ to_title_fade:
     sta ptr+1
     jsr write_string
 
+    bit PPU_STATUS
     lda #$00
-    sta PPU_SCROLL
-    sta PPU_SCROLL
+    sta PPU_ADDR
+    sta PPU_ADDR
     lda ppu_ctrl_shadow
     sta PPU_CTRL
+    lda #$00
+    sta PPU_SCROLL           ; X = 0
+    sta PPU_SCROLL           ; Y = 0
     lda ppu_mask_shadow
     sta PPU_MASK
 
@@ -1270,11 +1291,15 @@ to_title_fade:
     dex
     bne :-
 
+    bit PPU_STATUS
     lda #$00
-    sta PPU_SCROLL
-    sta PPU_SCROLL
+    sta PPU_ADDR
+    sta PPU_ADDR
     lda ppu_ctrl_shadow
     sta PPU_CTRL
+    lda #$00
+    sta PPU_SCROLL           ; X = 0
+    sta PPU_SCROLL           ; Y = 0
     lda ppu_mask_shadow
     sta PPU_MASK
 
@@ -1331,11 +1356,15 @@ to_title_fade:
 @write:
     jsr write_string
 
+    bit PPU_STATUS
     lda #$00
-    sta PPU_SCROLL
-    sta PPU_SCROLL
+    sta PPU_ADDR
+    sta PPU_ADDR
     lda ppu_ctrl_shadow
     sta PPU_CTRL
+    lda #$00
+    sta PPU_SCROLL           ; X = 0
+    sta PPU_SCROLL           ; Y = 0
     lda ppu_mask_shadow
     sta PPU_MASK
     rts
@@ -1355,11 +1384,15 @@ to_title_fade:
     dex
     bne :-
 
+    bit PPU_STATUS
     lda #$00
-    sta PPU_SCROLL
-    sta PPU_SCROLL
+    sta PPU_ADDR
+    sta PPU_ADDR
     lda ppu_ctrl_shadow
     sta PPU_CTRL
+    lda #$00
+    sta PPU_SCROLL           ; X = 0
+    sta PPU_SCROLL           ; Y = 0
     lda ppu_mask_shadow
     sta PPU_MASK
     rts
@@ -1411,11 +1444,15 @@ to_title_fade:
     sta PPU_DATA
 
     ; Reset scroll and CTRL after direct VRAM writes.
+    bit PPU_STATUS
     lda #$00
-    sta PPU_SCROLL
-    sta PPU_SCROLL
+    sta PPU_ADDR
+    sta PPU_ADDR
     lda ppu_ctrl_shadow
     sta PPU_CTRL
+    lda #$00
+    sta PPU_SCROLL           ; X = 0
+    sta PPU_SCROLL           ; Y = 0
 
     ; Reset game state variables.
     lda #PADDLE_START_Y
