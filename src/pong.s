@@ -28,10 +28,14 @@ STATE_TO_TITLE    = 4
 STATE_TITLE_IN    = 5
 STATE_TITLE       = 6
 STATE_MENU        = 7
+STATE_DIFFICULTY  = 12
 STATE_MENU_OUT    = 8
 STATE_TO_GAME     = 9
 STATE_GAME_IN     = 10
 STATE_GAME        = 11
+STATE_GAME_OVER   = 13
+STATE_PAUSE       = 14
+STATE_TO_TITLE_FADE = 15       ; fade current field down before returning home
 
 ; Controller bits (standard NES button order)
 BTN_A     = $80
@@ -109,6 +113,11 @@ vram_lo:        .res 1
 vram_val:       .res 1
 vram_pending:   .res 1
 pending_p2_reset:.res 1      ; queue a "P2 = 0" write on the next frame
+winner:         .res 1      ; 1 or 2 - whoever triggered STATE_GAME_OVER
+difficulty_sel: .res 1      ; 0 = EASY, 1 = NORMAL, 2 = HARD
+ai_skip_mask:   .res 1      ; frame_counter AND mask - AI moves when result = 0
+ai_step:        .res 1      ; pixels per AI move
+pause_sel:      .res 1      ; 0 = RESUME, 1 = EXIT
 tmp0:           .res 1
 tmp1:           .res 1
 ptr:            .res 2
@@ -323,6 +332,18 @@ main_loop:
 :   cmp #STATE_GAME
     bne :+
     jmp game
+:   cmp #STATE_DIFFICULTY
+    bne :+
+    jmp difficulty
+:   cmp #STATE_GAME_OVER
+    bne :+
+    jmp game_over
+:   cmp #STATE_PAUSE
+    bne :+
+    jmp pause
+:   cmp #STATE_TO_TITLE_FADE
+    bne :+
+    jmp to_title_fade
 :   rts
 
 intro_in:
@@ -431,6 +452,49 @@ menu:
     clc
     adc #1
     sta player_count
+    cmp #1
+    bne @skip_diff
+    ; 1P mode: stop at difficulty menu first
+    jsr open_difficulty_menu
+    lda #STATE_DIFFICULTY
+    sta state
+    lda #0
+    sta state_timer
+    rts
+@skip_diff:
+    jsr apply_difficulty            ; 2P: irrelevant, load NORMAL as default
+    lda #STATE_MENU_OUT
+    sta state
+    lda #0
+    sta state_timer
+:   rts
+
+; -------------------------------------------------------------
+; Difficulty selection menu (only shown for 1P mode)
+; -------------------------------------------------------------
+difficulty:
+    lda pad1_new
+    and #BTN_UP
+    beq @check_down
+    lda difficulty_sel
+    beq @check_down
+    dec difficulty_sel
+    jsr update_diff_cursor
+    jmp @check_start
+@check_down:
+    lda pad1_new
+    and #BTN_DOWN
+    beq @check_start
+    lda difficulty_sel
+    cmp #2
+    bcs @check_start
+    inc difficulty_sel
+    jsr update_diff_cursor
+@check_start:
+    lda pad1_new
+    and #BTN_START
+    beq :+
+    jsr apply_difficulty
     lda #STATE_MENU_OUT
     sta state
     lda #0
@@ -492,6 +556,17 @@ game_in:
 :   rts
 
 game:
+    ; Start opens the pause menu.
+    lda pad1_new
+    and #BTN_START
+    beq @no_pause
+    jsr open_pause_menu
+    lda #STATE_PAUSE
+    sta state
+    lda #0
+    sta state_timer
+    rts
+@no_pause:
     ; Drain a deferred "P2 score = 0" from last frame's game-over.
     lda pending_p2_reset
     beq :+
@@ -518,6 +593,92 @@ game:
 :   jsr ball_tick
 @done:
     rts
+
+; -------------------------------------------------------------
+; Game-over banner: hold for ~3s showing "PX WINS!" then reset.
+; -------------------------------------------------------------
+game_over:
+    lda state_timer
+    cmp #180
+    bcc :+
+    ; 3s elapsed - reset scores, clear banner, back to play.
+    jsr close_game_over_banner
+    lda #0
+    sta p1_score
+    sta p2_score
+    jsr push_p1_score
+    lda #1
+    sta pending_p2_reset
+    jsr ball_reset_on_paddle
+    lda #STATE_GAME
+    sta state
+    lda #0
+    sta state_timer
+:   rts
+
+; -------------------------------------------------------------
+; Pause: Resume / Exit menu on top of the frozen play field.
+; -------------------------------------------------------------
+pause:
+    lda pad1_new
+    and #(BTN_UP | BTN_DOWN)
+    beq @check_confirm
+    lda pause_sel
+    eor #$01
+    sta pause_sel
+    jsr update_pause_cursor
+@check_confirm:
+    lda pad1_new
+    and #(BTN_START | BTN_A)
+    beq :+
+    lda pause_sel
+    bne @exit
+    ; RESUME
+    jsr close_pause_menu
+    lda #STATE_GAME
+    sta state
+    lda #0
+    sta state_timer
+    rts
+@exit:
+    ; EXIT -> fade down the field then go back to title.
+    jsr close_pause_menu
+    lda #STATE_TO_TITLE_FADE
+    sta state
+    lda #0
+    sta state_timer
+:   rts
+
+; -------------------------------------------------------------
+; Fade the play field out, then swap back to the title screen.
+; -------------------------------------------------------------
+to_title_fade:
+    lda frame_counter
+    and #$0F
+    bne :+
+    lda fade_level
+    beq :+
+    dec fade_level
+:   lda fade_level
+    bne :+
+    ; Fully black - hide all play-field sprites, swap to title.
+    ldx #0
+    lda #$FF
+@hide_oam:
+    sta oam_buffer, x
+    inx
+    bne @hide_oam
+    lda #$00
+    sta PPU_MASK
+    jsr load_title_screen
+    jsr music_start
+    lda ppu_mask_shadow
+    sta PPU_MASK
+    lda #STATE_TITLE_IN
+    sta state
+    lda #0
+    sta state_timer
+:   rts
 .endproc
 
 ; -------------------------------------------------------------
@@ -870,6 +1031,328 @@ game:
     sta oam_buffer + 2
     lda #CURSOR_X
     sta oam_buffer + 3
+    rts
+.endproc
+
+; =============================================================
+; Difficulty select, pause, and game-over banner helpers
+; =============================================================
+
+; Erase the 1P/2P menu text and write EASY/NORMAL/HARD options.
+.proc open_difficulty_menu
+    lda #$00
+    sta PPU_MASK
+
+    ; Clear row 16 cols 13-21 (old "1 PLAYER" plus a little)
+    lda #$22
+    sta PPU_ADDR
+    lda #$0D
+    sta PPU_ADDR
+    ldx #10
+    lda #0
+:   sta PPU_DATA
+    dex
+    bne :-
+
+    ; Clear row 18 cols 13-22
+    lda #$22
+    sta PPU_ADDR
+    lda #$4D
+    sta PPU_ADDR
+    ldx #10
+    lda #0
+:   sta PPU_DATA
+    dex
+    bne :-
+
+    ; "EASY"   at row 14, col 14  ($2000 + 14*32 + 14 = $21CE)
+    lda #$21
+    sta PPU_ADDR
+    lda #$CE
+    sta PPU_ADDR
+    lda #<diff_easy_text
+    sta ptr
+    lda #>diff_easy_text
+    sta ptr+1
+    jsr write_string
+
+    ; "NORMAL" at row 16, col 13  ($220D)
+    lda #$22
+    sta PPU_ADDR
+    lda #$0D
+    sta PPU_ADDR
+    lda #<diff_normal_text
+    sta ptr
+    lda #>diff_normal_text
+    sta ptr+1
+    jsr write_string
+
+    ; "HARD"   at row 18, col 14  ($224E)
+    lda #$22
+    sta PPU_ADDR
+    lda #$4E
+    sta PPU_ADDR
+    lda #<diff_hard_text
+    sta ptr
+    lda #>diff_hard_text
+    sta ptr+1
+    jsr write_string
+
+    lda #$00
+    sta PPU_SCROLL
+    sta PPU_SCROLL
+    lda ppu_ctrl_shadow
+    sta PPU_CTRL
+    lda ppu_mask_shadow
+    sta PPU_MASK
+
+    lda #1                      ; default NORMAL
+    sta difficulty_sel
+    jsr update_diff_cursor
+    rts
+.endproc
+
+; Place cursor sprite to point at the currently selected difficulty.
+.proc update_diff_cursor
+    lda difficulty_sel
+    beq @easy
+    cmp #1
+    beq @normal
+    ; HARD
+    lda #18*8 - 1
+    jmp @set
+@easy:
+    lda #14*8 - 1
+    jmp @set
+@normal:
+    lda #16*8 - 1
+@set:
+    sta oam_buffer + 0
+    lda #$03
+    sta oam_buffer + 1
+    lda #$00
+    sta oam_buffer + 2
+    lda #CURSOR_X
+    sta oam_buffer + 3
+    rts
+.endproc
+
+; Load AI parameters from difficulty_sel. Called when Start is
+; pressed on either the difficulty menu or the main menu (2P mode
+; picks defaults here too).
+.proc apply_difficulty
+    lda difficulty_sel
+    beq @easy
+    cmp #2
+    beq @hard
+    ; NORMAL
+    lda #$01
+    sta ai_skip_mask
+    lda #1
+    sta ai_step
+    rts
+@easy:
+    lda #$03
+    sta ai_skip_mask
+    lda #1
+    sta ai_step
+    rts
+@hard:
+    lda #$00
+    sta ai_skip_mask
+    lda #2
+    sta ai_step
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; Pause menu
+; -------------------------------------------------------------
+.proc open_pause_menu
+    lda #$00
+    sta PPU_MASK
+
+    ; "PAUSED" at row 12, col 13 ($218D)
+    lda #$21
+    sta PPU_ADDR
+    lda #$8D
+    sta PPU_ADDR
+    lda #<pause_title_text
+    sta ptr
+    lda #>pause_title_text
+    sta ptr+1
+    jsr write_string
+
+    ; "RESUME" at row 16, col 13 ($220D)
+    lda #$22
+    sta PPU_ADDR
+    lda #$0D
+    sta PPU_ADDR
+    lda #<pause_resume_text
+    sta ptr
+    lda #>pause_resume_text
+    sta ptr+1
+    jsr write_string
+
+    ; "EXIT" at row 18, col 13 ($224D)
+    lda #$22
+    sta PPU_ADDR
+    lda #$4D
+    sta PPU_ADDR
+    lda #<pause_exit_text
+    sta ptr
+    lda #>pause_exit_text
+    sta ptr+1
+    jsr write_string
+
+    lda #$00
+    sta PPU_SCROLL
+    sta PPU_SCROLL
+    lda ppu_ctrl_shadow
+    sta PPU_CTRL
+    lda ppu_mask_shadow
+    sta PPU_MASK
+
+    ; Hide the ball sprite while paused.
+    lda #$FF
+    sta oam_buffer + OAM_BALL * 4 + 0
+
+    lda #0
+    sta pause_sel
+    jsr update_pause_cursor
+    rts
+.endproc
+
+; Clear the pause menu tiles and hide its cursor.
+.proc close_pause_menu
+    lda #$00
+    sta PPU_MASK
+
+    ; Row 12, col 13-18 (6 tiles)
+    lda #$21
+    sta PPU_ADDR
+    lda #$8D
+    sta PPU_ADDR
+    ldx #6
+    lda #0
+:   sta PPU_DATA
+    dex
+    bne :-
+
+    ; Row 16, col 13-18
+    lda #$22
+    sta PPU_ADDR
+    lda #$0D
+    sta PPU_ADDR
+    ldx #6
+    lda #0
+:   sta PPU_DATA
+    dex
+    bne :-
+
+    ; Row 18, col 13-18
+    lda #$22
+    sta PPU_ADDR
+    lda #$4D
+    sta PPU_ADDR
+    ldx #6
+    lda #0
+:   sta PPU_DATA
+    dex
+    bne :-
+
+    lda #$00
+    sta PPU_SCROLL
+    sta PPU_SCROLL
+    lda ppu_ctrl_shadow
+    sta PPU_CTRL
+    lda ppu_mask_shadow
+    sta PPU_MASK
+
+    ; Hide cursor and bring the ball back.
+    lda #$FF
+    sta oam_buffer + 0
+    jsr refresh_ball
+    rts
+.endproc
+
+.proc update_pause_cursor
+    lda pause_sel
+    beq @top
+    lda #CURSOR_Y_2P
+    jmp @set
+@top:
+    lda #CURSOR_Y_1P
+@set:
+    sta oam_buffer + 0
+    lda #$03
+    sta oam_buffer + 1
+    lda #$00
+    sta oam_buffer + 2
+    lda #CURSOR_X
+    sta oam_buffer + 3
+    rts
+.endproc
+
+; -------------------------------------------------------------
+; Game-over banner ("P1 WINS!" / "P2 WINS!") at row 14, col 12
+; -------------------------------------------------------------
+.proc open_game_over_banner
+    lda #$00
+    sta PPU_MASK
+
+    lda #$21
+    sta PPU_ADDR
+    lda #$CC                    ; 14*32 + 12 = $1CC
+    sta PPU_ADDR
+
+    lda winner
+    cmp #1
+    bne @p2
+    lda #<go_p1_text
+    sta ptr
+    lda #>go_p1_text
+    sta ptr+1
+    jmp @write
+@p2:
+    lda #<go_p2_text
+    sta ptr
+    lda #>go_p2_text
+    sta ptr+1
+@write:
+    jsr write_string
+
+    lda #$00
+    sta PPU_SCROLL
+    sta PPU_SCROLL
+    lda ppu_ctrl_shadow
+    sta PPU_CTRL
+    lda ppu_mask_shadow
+    sta PPU_MASK
+    rts
+.endproc
+
+.proc close_game_over_banner
+    lda #$00
+    sta PPU_MASK
+
+    lda #$21
+    sta PPU_ADDR
+    lda #$CC
+    sta PPU_ADDR
+    ldx #8
+    lda #0
+:   sta PPU_DATA
+    dex
+    bne :-
+
+    lda #$00
+    sta PPU_SCROLL
+    sta PPU_SCROLL
+    lda ppu_ctrl_shadow
+    sta PPU_CTRL
+    lda ppu_mask_shadow
+    sta PPU_MASK
     rts
 .endproc
 
@@ -1347,33 +1830,48 @@ game:
 .endproc
 
 ; -------------------------------------------------------------
-; If either score reaches WIN_SCORE, reset both scoreboards and scores.
+; If either score reaches WIN_SCORE, transition to STATE_GAME_OVER
+; (banner + 3s delay). Actual reset happens when that state ends.
 ; -------------------------------------------------------------
 .proc check_game_over
     lda p1_score
     cmp #WIN_SCORE
-    bcs @restart
+    bcs @win_p1
     lda p2_score
     cmp #WIN_SCORE
-    bcs @restart
+    bcs @win_p2
     rts
-@restart:
-    lda #0
-    sta p1_score
-    sta p2_score
-    jsr push_p1_score         ; queue P1 tile reset this frame
+@win_p1:
     lda #1
-    sta pending_p2_reset      ; next frame, queue P2 tile reset
+    sta winner
+    jmp @enter
+@win_p2:
+    lda #2
+    sta winner
+@enter:
+    jsr open_game_over_banner
+    lda #STATE_GAME_OVER
+    sta state
+    lda #0
+    sta state_timer
     rts
 .endproc
 
 ; -------------------------------------------------------------
 ; CPU AI for P2 in 1P mode: move P2 paddle toward ball center.
+; Difficulty scales how often the AI moves (ai_skip_mask) and how
+; far it moves per tick (ai_step).
 ; -------------------------------------------------------------
 .proc ai_paddle_p2
     ; Only chase when the ball is moving toward P2 or sitting still.
     lda ball_vx
     bmi @hold             ; moving away - idle
+
+    ; Throttle moves based on difficulty.
+    lda frame_counter
+    and ai_skip_mask
+    bne @hold
+
     ; target = ball_y - PADDLE_H/2 + 4  (align paddle centre to ball)
     lda ball_y
     sec
@@ -1385,14 +1883,14 @@ game:
     bcs @go_up
     ; p2_y < tmp0 -> move down
     clc
-    adc #PADDLE_SPEED
+    adc ai_step
     cmp tmp0
     bcc @save
     lda tmp0
     jmp @save
 @go_up:
     sec
-    sbc #PADDLE_SPEED
+    sbc ai_step
     cmp tmp0
     bcs @save
     lda tmp0
@@ -1597,6 +2095,22 @@ menu_1p_text:
     .byte "1 PLAYER", 0
 menu_2p_text:
     .byte "2 PLAYERS", 0
+diff_easy_text:
+    .byte "EASY", 0
+diff_normal_text:
+    .byte "NORMAL", 0
+diff_hard_text:
+    .byte "HARD", 0
+pause_title_text:
+    .byte "PAUSED", 0
+pause_resume_text:
+    .byte "RESUME", 0
+pause_exit_text:
+    .byte "EXIT", 0
+go_p1_text:
+    .byte "P1 WINS!", 0
+go_p2_text:
+    .byte "P2 WINS!", 0
 
 ; APU note periods: C4, E4, G4, C5, G4, E4, C4, rest
 music_note_lo:
